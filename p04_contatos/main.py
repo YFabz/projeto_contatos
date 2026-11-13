@@ -1,119 +1,51 @@
-import re
-import unicodedata
+"""Agenda de contatos no terminal (Projeto 04).
 
-from pymongo.errors import ConnectionFailure, DuplicateKeyError, OperationFailure, PyMongoError
+Execute da raiz do projeto:  python -m p04_contatos.main
+(também funciona com:        python p04_contatos/main.py)
+"""
+import sys
+from pathlib import Path
 
-from conexao import conectar
+if __package__ in (None, ''):  # executado como script: põe a raiz do projeto no caminho
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+try:
+    from pymongo.errors import ConnectionFailure, DuplicateKeyError, PyMongoError
 
-PARTE_EMAIL = r"[a-z0-9!#$%&'*+/=?^_`{|}~-]+"
-FORMATO_EMAIL = (
-    rf'(?=[^@]{{1,64}}@){PARTE_EMAIL}(?:\.{PARTE_EMAIL})*@'
-    r'(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}'
-)
-FORMATO_TELEFONE = (
-    r'(?=(?:[^0-9]*[0-9]){8,15}[^0-9]*$)'
-    r'\+?(?:[0-9]+[ .-]?)?(?:\([0-9]{2,3}\) ?)?[0-9]+(?:[ .-][0-9]+)*'
-)
-MENSAGEM_TELEFONE_INVALIDO = 'Telefone inválido. Use de 8 a 15 dígitos, como (11) 90000-0001.'
-VALIDACAO = {
-    'validator': {
-        '$jsonSchema': {
-            'bsonType': 'object',
-            'required': ['nome', 'nome_busca', 'email', 'telefone'],
-            'properties': {
-                'nome': {'bsonType': 'string', 'pattern': r'\S'},
-                'nome_busca': {'bsonType': 'string', 'pattern': r'\S'},
-                'email': {
-                    'bsonType': 'string',
-                    'maxLength': 254,
-                    'pattern': rf'\A{FORMATO_EMAIL}\z',
-                },
-                'telefone': {'bsonType': 'string', 'pattern': rf'\A{FORMATO_TELEFONE}\z'},
-                'empresa': {'bsonType': 'string', 'pattern': r'\S'},
-            },
-        },
-    },
-    'validationLevel': 'moderate',
-    'validationAction': 'error',
-}
-
-
-def normalizar_nome(nome):
-    decomposto = unicodedata.normalize('NFD', nome.casefold())
-    return ''.join(letra for letra in decomposto if not unicodedata.combining(letra)).strip()
-
-
-def preparar_contatos(banco):
-    contatos = banco['contatos_p04']
-    opcoes = contatos.options()
-    if any(opcoes.get(chave) != valor for chave, valor in VALIDACAO.items()):
-        try:
-            banco.create_collection(contatos.name, check_exists=False, **VALIDACAO)
-        except OperationFailure as erro:
-            if erro.code != 48:
-                raise
-            banco.command('collMod', contatos.name, **VALIDACAO)
-
-    contatos.create_index('email', unique=True)
-    contatos.create_index('nome')
-
-    sem_nome_busca = {'nome_busca': {'$exists': False}}
-    for contato in contatos.find({**sem_nome_busca, 'nome': {'$type': 'string'}}, {'nome': 1}):
-        nome = contato['nome']
-        contatos.update_one(
-            {**sem_nome_busca, '_id': contato['_id'], 'nome': nome},
-            {'$set': {'nome_busca': normalizar_nome(nome)}},
-        )
-
-    return contatos
+    from conexao import conectar
+    from p04_contatos.repositorio import (atualizar_telefone, buscar_contatos, criar_contato,
+                                          preparar_contatos, remover_contato)
+    from p04_contatos.validacao import ContatoInvalido
+except ImportError as erro:
+    print(f'Dependência ausente ({erro}).')
+    print('Ative o ambiente virtual e rode: python -m pip install -r requirements.txt')
+    raise SystemExit(1)
 
 
 def adicionar(contatos):
-    nome = input('Nome: ').strip()
-    email = input('E-mail: ').strip().lower()
-    telefone = input('Telefone: ').strip()
-    nome_busca = normalizar_nome(nome)
-    if not all((nome_busca, email, telefone)):
-        print('Preencha o nome, o e-mail e o telefone.')
-        return
-    if len(email) > 254 or not re.fullmatch(FORMATO_EMAIL, email):
-        print('E-mail inválido.')
-        return
-    if not re.fullmatch(FORMATO_TELEFONE, telefone):
-        print(MENSAGEM_TELEFONE_INVALIDO)
-        return
-
-    empresa = input('Empresa ou organização (opcional): ').strip()
-    contato = {
-        'nome': nome,
-        'nome_busca': nome_busca,
-        'email': email,
-        'telefone': telefone,
-    }
-    if empresa:
-        contato['empresa'] = empresa
-
+    nome = input('Nome: ')
+    email = input('E-mail: ')
+    telefone = input('Telefone: ')
+    empresa = input('Empresa ou organização (opcional): ')
     try:
-        contatos.insert_one(contato)
-        print('Contato salvo!')
+        criar_contato(contatos, nome, email, telefone, empresa)
+    except ContatoInvalido as erro:
+        print(erro)
     except DuplicateKeyError:
         print('E-mail já utilizado.')
+    else:
+        print('Contato salvo!')
 
 
 def buscar(contatos):
-    trecho = normalizar_nome(input('Parte do nome: '))
-    if not trecho:
-        print('Informe um trecho do nome.')
+    try:
+        encontrados = buscar_contatos(contatos, input('Parte do nome: '))
+    except ContatoInvalido as erro:
+        print(erro)
         return
-
-    filtro = {'nome_busca': {'$regex': re.escape(trecho)}}
-    campos = {'_id': 0, 'nome': 1, 'email': 1, 'telefone': 1, 'empresa': 1}
-    encontrados = list(contatos.find(filtro, campos).sort('nome', 1))
     if not encontrados:
         print('Nenhum contato encontrado.')
         return
-
     for contato in encontrados:
         print(f"{contato['nome']} | {contato['email']} | {contato['telefone']}")
         if contato.get('empresa'):
@@ -121,27 +53,23 @@ def buscar(contatos):
 
 
 def atualizar(contatos):
-    email = input('E-mail do contato: ').strip().lower()
-    telefone = input('Novo telefone: ').strip()
-    if not email or not telefone:
-        print('Preencha o e-mail e o novo telefone.')
+    email = input('E-mail do contato: ')
+    telefone = input('Novo telefone: ')
+    try:
+        atualizado = atualizar_telefone(contatos, email, telefone)
+    except ContatoInvalido as erro:
+        print(erro)
         return
-    if not re.fullmatch(FORMATO_TELEFONE, telefone):
-        print(MENSAGEM_TELEFONE_INVALIDO)
-        return
-
-    resultado = contatos.update_one({'email': email}, {'$set': {'telefone': telefone}})
-    print('Telefone atualizado!' if resultado.matched_count else 'Contato não encontrado.')
+    print('Telefone atualizado!' if atualizado else 'Contato não encontrado.')
 
 
 def remover(contatos):
-    email = input('E-mail do contato: ').strip().lower()
-    if not email:
-        print('Informe o e-mail.')
+    try:
+        removido = remover_contato(contatos, input('E-mail do contato: '))
+    except ContatoInvalido as erro:
+        print(erro)
         return
-
-    resultado = contatos.delete_one({'email': email})
-    print('Contato excluído!' if resultado.deleted_count else 'Contato não encontrado.')
+    print('Contato excluído!' if removido else 'Contato não encontrado.')
 
 
 def main():
